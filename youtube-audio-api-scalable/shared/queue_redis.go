@@ -28,9 +28,13 @@ func (q *RedisQueue) Publish(message JobMessage) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	b, _ := json.Marshal(message)
-	args := &redis.XAddArgs{Stream: q.name, MaxLenApprox: int64(q.maxLen), Values: map[string]any{"data": b}}
-	return q.client.XAdd(ctx, args).Err()
+    b, _ := json.Marshal(message)
+    args := &redis.XAddArgs{Stream: q.name, Values: map[string]any{"data": b}}
+    if q.maxLen > 0 {
+        args.MaxLen = int64(q.maxLen)
+        args.Approx = true
+    }
+    return q.client.XAdd(ctx, args).Err()
 }
 
 func (q *RedisQueue) Consume() (<-chan JobMessage, error) {
