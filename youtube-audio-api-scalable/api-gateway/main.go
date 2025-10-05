@@ -2,17 +2,19 @@
 package main
 
 import (
-	"encoding/json"
-	"fmt"
-	"log"
-	"net/http"
-	"os"
-	"path/filepath"
-	"time"
+    "encoding/json"
+    "fmt"
+    "log"
+    "net/http"
+    "net/url"
+    "os"
+    "path/filepath"
+    "strings"
+    "time"
 
-	"youtube-audio-api-scalable/shared" // Import shared package
+    "youtube-audio-api-scalable/shared" // Import shared package
 
-	"github.com/google/uuid"
+    "github.com/google/uuid"
 )
 
 // Global instances for our conceptual database and message queue
@@ -20,6 +22,7 @@ var (
 	cfg *shared.Config
 	db  shared.DatabaseClient
 	mq  shared.MessageQueueClient
+    rl  *shared.RateLimiter
 )
 
 func main() {
@@ -29,18 +32,30 @@ func main() {
 	}
 	log.Printf("API Gateway starting on port %s", cfg.APIGatewayPort)
 
-	// Initialize our conceptual in-memory database
-	db = shared.NewInMemoryDB()
-	log.Println("Initialized in-memory database.")
+    // Try Redis-backed DB and Queue first; fallback to in-memory
+    redisClient := shared.NewRedisClient(cfg)
+    if err := shared.PingRedis(redisClient); err == nil && redisClient != nil {
+        db = shared.NewRedisDB(redisClient)
+        mq = shared.NewRedisQueue(redisClient, cfg.QueueName, cfg.QueueMaxLength)
+        log.Println("Initialized Redis-backed DB and Queue.")
+    } else {
+        db = shared.NewInMemoryDB()
+        mq = shared.NewInMemoryQueue(100)
+        log.Println("Initialized in-memory DB and Queue (Redis not configured/reachable).")
+    }
+    defer mq.Close() // Ensure the queue is closed on shutdown
 
-	// Initialize our conceptual in-memory message queue
-	// A buffer size of 100 is chosen as an example. In production, this would be an external MQ.
-	mq = shared.NewInMemoryQueue(100)
-	defer mq.Close() // Ensure the queue is closed on shutdown
-	log.Println("Initialized in-memory message queue.")
+    // Rate limiter
+    rl = shared.NewRateLimiter(cfg, redisClient)
+
+    // Ensure output directory exists for downloads
+    if err := os.MkdirAll(shared.OutputDir, os.ModePerm); err != nil {
+        log.Fatalf("Failed to create output dir: %v", err)
+    }
 
 	http.HandleFunc("/extract", handleExtract)
-	http.HandleFunc("/status/", handleStatus)
+    http.HandleFunc("/status/", handleStatus)
+    http.HandleFunc("/download/", handleDownload)
 	http.HandleFunc("/health", handleHealth)
 
 	// Admin endpoints (with a simple middleware for auth)
@@ -59,9 +74,19 @@ func main() {
 
 // Enable CORS for browser requests
 func enableCORS(w http.ResponseWriter) {
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS, DELETE")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+    // For simplicity, allow '*' unless specific origins configured
+    origin := "*"
+    if len(cfg.AllowedOrigins) == 1 && cfg.AllowedOrigins[0] == "*" {
+        origin = "*"
+    } else {
+        // In production, you would reflect the Origin if it's in the allowlist
+        origin = strings.Join(cfg.AllowedOrigins, ",")
+    }
+    w.Header().Set("Access-Control-Allow-Origin", origin)
+    w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS, DELETE")
+    w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+    w.Header().Set("Vary", "Origin")
+    w.Header().Set("Access-Control-Max-Age", "600")
 }
 
 // adminAuthMiddleware provides a basic bearer token authentication for admin routes
@@ -69,12 +94,16 @@ func adminAuthMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		enableCORS(w) // CORS for admin too
 		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusOK)
+            w.WriteHeader(http.StatusOK)
 			return
 		}
 
 		token := r.Header.Get("Authorization")
-		if token != "Bearer "+cfg.AdminToken { // Simple bearer token auth
+        if strings.TrimSpace(cfg.AdminToken) == "" {
+            http.Error(w, "Admin token not configured", http.StatusServiceUnavailable)
+            return
+        }
+        if token != "Bearer "+cfg.AdminToken { // Simple bearer token auth
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
@@ -86,7 +115,8 @@ func adminAuthMiddleware(next http.Handler) http.Handler {
 func handleExtract(w http.ResponseWriter, r *http.Request) {
 	enableCORS(w)
 	if r.Method == http.MethodOptions {
-		return
+        w.WriteHeader(http.StatusOK)
+        return
 	}
 	if r.Method != http.MethodPost {
 		http.Error(w, "Invalid request method", http.StatusMethodNotAllowed)
@@ -98,10 +128,36 @@ func handleExtract(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Invalid JSON", http.StatusBadRequest)
 		return
 	}
-	if req.URL == "" {
+    if req.URL == "" {
 		http.Error(w, "Missing YouTube URL", http.StatusBadRequest)
 		return
 	}
+
+    // Basic URL validation and allowed host check
+    parsed, err := url.Parse(req.URL)
+    if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+        http.Error(w, "Invalid URL", http.StatusBadRequest)
+        return
+    }
+    allowed := false
+    host := strings.ToLower(parsed.Host)
+    for _, h := range cfg.AllowedVideoHosts {
+        if h == "*" || strings.HasSuffix(host, strings.ToLower(h)) {
+            allowed = true
+            break
+        }
+    }
+    if !allowed {
+        http.Error(w, "Host not allowed", http.StatusBadRequest)
+        return
+    }
+
+    // Simple rate limiting per IP
+    ip := shared.GetClientIP(r)
+    if ok, _ := rl.Allow(ip); !ok {
+        http.Error(w, "Rate limit exceeded", http.StatusTooManyRequests)
+        return
+    }
 
 	jobID := uuid.New().String()
 	now := time.Now()
@@ -120,7 +176,7 @@ func handleExtract(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Printf("INFO: Job %s created in DB with status %s", jobID, job.Status)
 
-	// 2. Publish job to message queue
+    // 2. Publish job to message queue
 	jobMessage := shared.JobMessage{
 		JobID:       jobID,
 		OriginalURL: req.URL,
@@ -138,21 +194,50 @@ func handleExtract(w http.ResponseWriter, r *http.Request) {
 
 	// 3. Respond immediately to client
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{
-		"job_id":       jobID,
-		"status":       string(job.Status),
-		"message":      "Audio extraction started. Check status at /status/" + jobID,
-		"instructions": "A worker service will process this job and update its status. Polling /status/{job_id} is recommended.",
-	})
+    json.NewEncoder(w).Encode(map[string]string{
+        "job_id":       jobID,
+        "status":       string(job.Status),
+        "message":      "Audio extraction started. Check status at /status/" + jobID,
+        "instructions": "A worker service will process this job and update its status. Polling /status/{job_id} is recommended.",
+    })
 	fmt.Printf("🎬 API Gateway received job %s for URL: %s\n", jobID, req.URL)
+}
+
+// handleDownload: Streams the generated MP3 file to the client
+func handleDownload(w http.ResponseWriter, r *http.Request) {
+    enableCORS(w)
+    if r.Method == http.MethodOptions {
+        w.WriteHeader(http.StatusOK)
+        return
+    }
+    if r.Method != http.MethodGet {
+        http.Error(w, "Invalid request method", http.StatusMethodNotAllowed)
+        return
+    }
+    jobID := filepath.Base(r.URL.Path)
+    job, err := db.GetJob(jobID)
+    if err != nil || job.Status != shared.JobStatusCompleted || job.FilePath == "" {
+        http.Error(w, "File not available", http.StatusNotFound)
+        return
+    }
+    // Serve file with appropriate headers
+    w.Header().Set("Content-Type", "audio/mpeg")
+    w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s.mp3\"", jobID))
+    // Let http.ServeFile handle range requests and efficient serving
+    http.ServeFile(w, r, job.FilePath)
 }
 
 // handleStatus: Checks job status from the database
 func handleStatus(w http.ResponseWriter, r *http.Request) {
 	enableCORS(w)
 	if r.Method == http.MethodOptions {
-		return
+        w.WriteHeader(http.StatusOK)
+        return
 	}
+    if r.Method != http.MethodGet {
+        http.Error(w, "Invalid request method", http.StatusMethodNotAllowed)
+        return
+    }
 
 	jobID := filepath.Base(r.URL.Path) // Extract job ID from /status/{job_id}
 
@@ -162,6 +247,15 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+    // For completed jobs, include a direct download URL if not set
+    if job.Status == shared.JobStatusCompleted && job.DownloadEndpoint == "" {
+        base := cfg.PublicAPIBaseURL
+        if strings.TrimSpace(base) == "" {
+            base = fmt.Sprintf("http://localhost:%s", cfg.APIGatewayPort)
+        }
+        job.DownloadEndpoint = fmt.Sprintf("%s/download/%s", strings.TrimRight(base, "/"), jobID)
+    }
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(job)
 }
@@ -170,21 +264,42 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 func handleHealth(w http.ResponseWriter, r *http.Request) {
 	enableCORS(w)
 	if r.Method == http.MethodOptions {
-		return
+        w.WriteHeader(http.StatusOK)
+        return
 	}
 
-	// In a real system, you'd check DB connection, MQ connection, etc.
-	// For now, assume if the server is up, it's healthy.
+    // Perform lightweight dependency checks
+    status := "ok"
+    details := map[string]string{}
+    if rc := shared.NewRedisClient(cfg); rc != nil {
+        if err := shared.PingRedis(rc); err != nil {
+            status = "degraded"
+            details["redis"] = "unreachable"
+        } else {
+            details["redis"] = "ok"
+        }
+    } else {
+        details["redis"] = "not_configured"
+    }
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{
-		"status":  "ok",
-		"message": "API Gateway is healthy",
-	})
+    json.NewEncoder(w).Encode(map[string]any{
+        "status":  status,
+        "details": details,
+    })
 }
 
 // handleAdminListJobs: Lists all jobs from the database
 func handleAdminListJobs(w http.ResponseWriter, r *http.Request) {
 	// Auth handled by middleware
+    enableCORS(w)
+    if r.Method == http.MethodOptions {
+        w.WriteHeader(http.StatusOK)
+        return
+    }
+    if r.Method != http.MethodGet {
+        http.Error(w, "Invalid request method", http.StatusMethodNotAllowed)
+        return
+    }
 	jobs, err := db.GetAllJobs()
 	if err != nil {
 		log.Printf("ERROR: Failed to get all jobs for admin: %v", err)
@@ -199,6 +314,15 @@ func handleAdminListJobs(w http.ResponseWriter, r *http.Request) {
 // handleAdminGetJob: Get details for a specific job from the database
 func handleAdminGetJob(w http.ResponseWriter, r *http.Request) {
 	// Auth handled by middleware
+    enableCORS(w)
+    if r.Method == http.MethodOptions {
+        w.WriteHeader(http.StatusOK)
+        return
+    }
+    if r.Method != http.MethodGet {
+        http.Error(w, "Invalid request method", http.StatusMethodNotAllowed)
+        return
+    }
 	jobID := filepath.Base(r.URL.Path) // Extract job ID from /admin/jobs/{job_id}
 
 	job, err := db.GetJob(jobID)
@@ -215,7 +339,8 @@ func handleAdminGetJob(w http.ResponseWriter, r *http.Request) {
 func handleAdminDeleteJob(w http.ResponseWriter, r *http.Request) {
 	// Auth handled by middleware
 	if r.Method == http.MethodOptions {
-		return
+        w.WriteHeader(http.StatusOK)
+        return
 	}
 	if r.Method != http.MethodDelete {
 		http.Error(w, "Invalid request method", http.StatusMethodNotAllowed)
@@ -231,18 +356,17 @@ func handleAdminDeleteJob(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Conceptual file deletion (in a real system, this would interact with Object Storage)
-	if job.FilePath != "" {
-		// Attempt to delete the file from shared.OutputDir if it exists locally
-		fullPath := filepath.Join(shared.OutputDir, jobID+".mp3")
-		if _, statErr := os.Stat(fullPath); statErr == nil { // Check if file exists
-			if rmErr := os.Remove(fullPath); rmErr != nil {
-				log.Printf("WARN: Failed to delete local file %s for job %s: %v", fullPath, jobID, rmErr)
-				// Don't fail the whole request, just log, as DB deletion is more critical
-			} else {
-				log.Printf("INFO: Deleted local file: %s", fullPath)
-			}
-		}
-	}
+    if job.FilePath != "" {
+        // Delete the actual stored file
+        fullPath := job.FilePath
+        if _, statErr := os.Stat(fullPath); statErr == nil { // Check if file exists
+            if rmErr := os.Remove(fullPath); rmErr != nil {
+                log.Printf("WARN: Failed to delete local file %s for job %s: %v", fullPath, jobID, rmErr)
+            } else {
+                log.Printf("INFO: Deleted local file: %s", fullPath)
+            }
+        }
+    }
 
 	if err := db.DeleteJob(jobID); err != nil {
 		log.Printf("ERROR: Failed to delete job %s from DB: %v", jobID, err)

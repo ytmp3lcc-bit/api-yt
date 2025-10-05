@@ -2,17 +2,18 @@
 package main
 
 import (
-	"bytes"
-	"encoding/json"
-	"fmt"
-	"log"
-	"net/http"
-	"os"
-	"os/exec"
-	"path/filepath"
-	"time"
+    "bytes"
+    "encoding/json"
+    "fmt"
+    "log"
+    "net/http"
+    "os"
+    "os/exec"
+    "path/filepath"
+    "strings"
+    "time"
 
-	"youtube-audio-api-scalable/shared" // Import shared package
+    "youtube-audio-api-scalable/shared" // Import shared package
 )
 
 // Global instances for our conceptual database and message queue
@@ -30,15 +31,18 @@ func main() {
 	}
 	log.Printf("Worker Service starting on port %s with %d max concurrent jobs", cfg.WorkerPort, cfg.MaxWorkers)
 
-	// Initialize our conceptual in-memory database (must be the same instance as API Gateway for this example)
-	// In a real distributed system, workers would connect to a persistent, central DB.
-	db = shared.NewInMemoryDB()
-	log.Println("Initialized conceptual in-memory database for worker (NOTE: this should be a shared persistent DB in prod).")
-
-	// Initialize our conceptual in-memory message queue (must be the same instance as API Gateway for this example)
-	mq = shared.NewInMemoryQueue(100)
-	defer mq.Close()
-	log.Println("Initialized conceptual in-memory message queue for worker (NOTE: this should be a shared external MQ in prod).")
+    // Initialize DB and Queue (prefer Redis when configured)
+    redisClient := shared.NewRedisClient(cfg)
+    if err := shared.PingRedis(redisClient); err == nil && redisClient != nil {
+        db = shared.NewRedisDB(redisClient)
+        mq = shared.NewRedisQueue(redisClient, cfg.QueueName, cfg.QueueMaxLength)
+        log.Println("Initialized Redis-backed DB and Queue for worker.")
+    } else {
+        db = shared.NewInMemoryDB()
+        mq = shared.NewInMemoryQueue(100)
+        log.Println("Initialized in-memory DB and Queue for worker (Redis not configured/reachable).")
+    }
+    defer mq.Close()
 
 	// Create a buffered channel to act as a semaphore for limiting concurrent workers
 	workerLimiter = make(chan struct{}, cfg.MaxWorkers)
@@ -118,13 +122,18 @@ func processJob(jobMessage shared.JobMessage) {
 	}
 	log.Printf("INFO: Job %s - Conversion completed successfully: %s", jobID, filePath)
 
-	// --- Step 3: Job completed successfully - Update DB ---
-	completedNow := time.Now()
-	job.Status = shared.JobStatusCompleted
-	job.Metadata = meta
-	job.FilePath = filePath
-	job.DownloadEndpoint = fmt.Sprintf("http://localhost:%s/download/%s", cfg.APIGatewayPort, jobID) // Point to API Gateway's download endpoint
-	job.CompletedAt = &completedNow
+    // --- Step 3: Job completed successfully - Update DB ---
+    completedNow := time.Now()
+    job.Status = shared.JobStatusCompleted
+    job.Metadata = meta
+    job.FilePath = filePath
+    // Construct public download endpoint using configured base URL if available
+    base := cfg.PublicAPIBaseURL
+    if strings.TrimSpace(base) == "" {
+        base = fmt.Sprintf("http://localhost:%s", cfg.APIGatewayPort)
+    }
+    job.DownloadEndpoint = fmt.Sprintf("%s/download/%s", strings.TrimRight(base, "/"), jobID)
+    job.CompletedAt = &completedNow
 
 	if err := db.UpdateJob(job); err != nil {
 		log.Printf("ERROR: Worker failed to update job %s status to Completed in DB: %v", jobID, err)
@@ -148,7 +157,17 @@ func handleJobFailure(job *shared.Job, errMsg string) {
 
 // getAudioStream: Retrieves audio stream URL and metadata using yt-dlp
 func getAudioStream(videoURL string) (string, *shared.Metadata, error) {
-	cmd := exec.Command("./yt-dlp", "-f", "bestaudio", "--dump-single-json", "--no-warnings", videoURL)
+    yt := cfg.YtDlpPath
+    if strings.TrimSpace(yt) == "" {
+        if p, err := exec.LookPath("yt-dlp"); err == nil {
+            yt = p
+        } else {
+            yt = "./yt-dlp"
+        }
+    }
+    // Respect max duration if configured
+    // We use --max-filesize as proxy is not suitable; yt-dlp supports --max-duration only via filters; here we parse metadata instead
+    cmd := exec.Command(yt, "-f", "bestaudio", "--dump-single-json", "--no-warnings", "--", videoURL)
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &out
@@ -171,7 +190,7 @@ func getAudioStream(videoURL string) (string, *shared.Metadata, error) {
 		return "", nil, fmt.Errorf("JSON parse error: %v\nOutput: %s", err, out.String())
 	}
 
-	// Assign to our Metadata struct
+    // Assign to our Metadata struct
 	meta := &shared.Metadata{
 		Title:    data.Title,
 		Uploader: data.Uploader,
@@ -180,6 +199,11 @@ func getAudioStream(videoURL string) (string, *shared.Metadata, error) {
 		Ext:      data.Ext,
 		Abr:      data.Abr,
 	}
+
+    // Enforce maximum duration
+    if cfg.MaxVideoDurationSeconds > 0 && int(data.Duration) > cfg.MaxVideoDurationSeconds {
+        return "", nil, fmt.Errorf("video duration exceeds limit: %ds > %ds", int(data.Duration), cfg.MaxVideoDurationSeconds)
+    }
 
 	return data.URL, meta, nil
 }
@@ -196,7 +220,15 @@ func convertToMP3(audioURL string, jobID string) (string, error) {
 
 	start := time.Now()
 
-	cmd := exec.Command("./ffmpeg", "-y", "-i", audioURL, "-vn", "-ab", "192k", "-ar", "44100", "-f", "mp3", outputPath)
+    ff := cfg.FFmpegPath
+    if strings.TrimSpace(ff) == "" {
+        if p, err := exec.LookPath("ffmpeg"); err == nil {
+            ff = p
+        } else {
+            ff = "./ffmpeg"
+        }
+    }
+    cmd := exec.Command(ff, "-y", "-i", audioURL, "-vn", "-ab", "192k", "-ar", "44100", "-f", "mp3", outputPath)
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &out
@@ -214,9 +246,10 @@ func convertToMP3(audioURL string, jobID string) (string, error) {
 // handleHealth: Basic health check for the Worker Service
 func handleHealth(w http.ResponseWriter, r *http.Request) {
 	// CORS for health endpoint
-	w.Header().Set("Access-Control-Allow-Origin", "*")
+    w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+    w.Header().Set("Access-Control-Max-Age", "600")
 
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusOK)
