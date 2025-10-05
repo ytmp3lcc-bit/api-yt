@@ -58,8 +58,7 @@ func (q *InMemoryQueue) Close() {
 	q.once.Do(func() {
 		log.Println("Queue: Closing...")
 		close(q.stop)
-		// Give some time for consumers to finish processing existing messages if needed
-		// For simplicity, we just close the channel directly here
-		close(q.queue)
+        // Do not close the queue channel abruptly to avoid panics in publishers.
+        // Let the process exit or GC collect when no references remain.
 	})
 }
